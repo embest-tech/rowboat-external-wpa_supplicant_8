@@ -43,9 +43,12 @@
 #if defined(ANDROID_BRCM_P2P_PATCH) && !defined(HOSTAPD)
 #include "wpa_supplicant_i.h"
 #endif
+
 #ifdef ANDROID
 #define WPA_EVENT_DRIVER_STATE		"CTRL-EVENT-DRIVER-STATE "
-#endif
+#include "common/wpa_ctrl.h"
+#endif /* ANDROID */
+
 #ifdef CONFIG_LIBNL20
 /* libnl 2.0 compatibility code */
 #define nl_handle nl_sock
@@ -190,8 +193,11 @@ struct wpa_driver_nl80211_data {
 	int last_freq_ht;
 #endif /* HOSTAPD */
 
+#ifdef ANDROID
 	u8 wowlan_triggers;
 	u8 wowlan_enabled;
+#endif
+
 };
 
 
@@ -4127,10 +4133,6 @@ static u32 sta_flags_nl80211(int flags)
 		f |= BIT(NL80211_STA_FLAG_SHORT_PREAMBLE);
 	if (flags & WPA_STA_MFP)
 		f |= BIT(NL80211_STA_FLAG_MFP);
-	if (flags & WPA_STA_TDLS_PEER)
-		f |= BIT(NL80211_STA_FLAG_TDLS_PEER);
-	if (flags & WPA_STA_PRE_ASSOC)
-		f |= BIT(NL80211_STA_FLAG_PRE_ASSOC);
 
 	return f;
 }
@@ -4841,12 +4843,6 @@ static int wpa_driver_nl80211_sta_set_flags(void *priv, const u8 *addr,
 
 	if (total_flags & WPA_STA_MFP)
 		NLA_PUT_FLAG(flags, NL80211_STA_FLAG_MFP);
-
-	if (total_flags & WPA_STA_TDLS_PEER)
-		NLA_PUT_FLAG(flags, NL80211_STA_FLAG_TDLS_PEER);
-
-	if (total_flags & WPA_STA_PRE_ASSOC)
-		NLA_PUT_FLAG(flags, NL80211_STA_FLAG_PRE_ASSOC);
 
 	if (nla_put_nested(msg, NL80211_ATTR_STA_FLAGS, flags))
 		goto nla_put_failure;
@@ -7015,9 +7011,8 @@ static const char * nl80211_get_radio_name(void *priv)
 	return drv->phyname;
 }
 
-
 static int nl80211_pmkid(struct i802_bss *bss, int cmd, const u8 *bssid,
-			 const u8 *pmkid)
+                         const u8 *pmkid)
 {
 	struct nl_msg *msg;
 
@@ -7040,30 +7035,389 @@ static int nl80211_pmkid(struct i802_bss *bss, int cmd, const u8 *bssid,
 }
 
 
+#define MAX_PATTERN_SIZE        256
+#define MAX_MASK_SIZE           (MAX_PATTERN_SIZE/8)
+
+/* Describes a single RX filter configuration */
+struct rx_filter {
+	/* name - A human recongmizable name for the filter */
+	char *name;
+
+	/* get_pattern_handler - A handler which enables the user to configure
+	 * the pattern dynamically (For example filter according to the HW addr).
+	 * If NULL the static pattern configured will be used.
+	 * buf - the pattern will be copied to buf
+	 * buflen - the size of buf
+	 * arg - A generic input argumet which can be passed to the handler
+	 */
+	int (* get_pattern_handler) (u8 *buf, int buflen, void* arg);
+
+	/* pattern - A static pattern to filter
+	 * This array contains the bytes of the pattern. The mask field
+	 * indicates which bytes should be used in the filter and which
+	 * can be discarded
+	 */
+	u8 pattern[MAX_PATTERN_SIZE];
+
+	/* pattern_len - The number of bytes used in pattern */	
+	u8 pattern_len;
+
+	/* mask - A bit mask indicating which bytes in pattern should be
+	 * used for filtering. Each bit here corresponds to a byte in pattern
+	 */
+	u8 mask[MAX_MASK_SIZE];
+
+	/* mask_len - The number of bytes used in mask */
+	u8 mask_len;
+};
+
+static u8 *nl80211_rx_filter_get_pattern(struct rx_filter *filter, void *arg)
+{
+	if (filter->get_pattern_handler) {
+		if (filter->get_pattern_handler(filter->pattern,
+					        filter->pattern_len, arg)) {
+			return NULL;
+		}
+	}
+
+	return filter->pattern;
+}
+
+static int nl80211_self_filter_get_pattern_handler(u8 *buf, int buflen, void *arg)
+{
+	int ret;
+	struct i802_bss *bss = (struct i802_bss *)arg;
+
+	ret = linux_get_ifhwaddr(bss->drv->ioctl_sock,
+				 bss->ifname, buf);
+	if (ret) {
+		wpa_printf(MSG_ERROR, "Failed to get own HW addr (%d)", ret);
+		return -1;
+	}
+	return 0;
+}
+
+static struct rx_filter rx_filters[] = {
+	{.name = "self",
+	 .pattern = {},
+	 .pattern_len = 6,
+	 .mask = { BIT(0) | BIT(1) | BIT(2) | BIT(3) | BIT(4) | BIT(5) },
+	 .mask_len = 1,
+	 .get_pattern_handler = nl80211_self_filter_get_pattern_handler,
+	},
+
+	{.name = "bcast",
+	 .pattern = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF},
+	 .pattern_len = 6,
+	 .mask = { BIT(0) | BIT(1) | BIT(2) | BIT(3) | BIT(4) | BIT(5) },
+	 .mask_len = 1,
+	},
+
+	{.name = "ipv4mc",
+	 .pattern = {0x01,0x00,0x5E},
+	 .pattern_len = 3,
+	 .mask = { BIT(0) | BIT(1) | BIT(2) },
+	 .mask_len = 1,
+	},
+
+	{.name = "ipv6mc",
+	 .pattern = {0x33,0x33},
+	 .pattern_len = 2,
+	 .mask = { BIT(0) | BIT(1) },
+	 .mask_len = 1,
+	},
+
+	{.name = "dhcp",
+	 .pattern = {0   , 0   , 0   , 0   , 0   , 0   , 0   , 0   ,
+		     0   , 0   , 0   , 0   , 0   , 0   , 0x45, 0   ,
+		     0   , 0   , 0   , 0   , 0   , 0   , 0   , 0x11,
+		     0   , 0   , 0   , 0   , 0   , 0   , 0   , 0   ,
+		     0   , 0   , 0   , 0   , 0x00, 0x44},
+	 .pattern_len = 38,
+	 .mask = { 0,                                 /* OCTET 1 */
+		   BIT(6),                            /* OCTET 2 */
+		   BIT(7),                            /* OCTET 3 */
+		   0,                                 /* OCTET 4 */
+		   BIT(4) | BIT(5) },                 /* OCTET 5 */
+	 .mask_len = 5,
+	},
+};
+
+#define NR_RX_FILTERS			(sizeof(rx_filters) / sizeof(struct rx_filter))
+
+static int nl80211_set_wowlan_triggers(struct i802_bss *bss, int enable)
+{
+	struct nl_msg *msg, *pats = NULL;
+	struct nlattr *wowtrig, *pat;
+	int i, ret = -1;
+	int filters;
+
+	bss->drv->wowlan_enabled = !!enable;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return -ENOMEM;
+
+	genlmsg_put(msg, 0, 0, genl_family_get_id(bss->drv->nl80211), 0,
+		    0, NL80211_CMD_SET_WOWLAN, 0);
+
+	NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, bss->drv->first_bss.ifindex);
+	wowtrig = nla_nest_start(msg, NL80211_ATTR_WOWLAN_TRIGGERS);
+
+	if (!wowtrig) {
+		ret = -ENOBUFS;
+		goto nla_put_failure;
+	}
+
+	if (!enable) {
+		NLA_PUT_FLAG(msg, NL80211_WOWLAN_TRIG_ANY);
+	} else {
+		pats = nlmsg_alloc();
+		if (!pats) {
+			ret = -ENOMEM;
+			goto nla_put_failure;
+		}
+
+		/* In ginger filter 0 and 1 are always set but in ICS they
+		   were completely removed. Make sure to always set them
+		   otherwise unicast and bcast are dropped */
+		filters = bss->drv->wowlan_triggers |= 3;
+
+		for (i = 0; i < NR_RX_FILTERS; i++) {
+			if (filters & (1 << i)) {
+				struct rx_filter *rx_filter = &rx_filters[i];
+				int patnr = 1;
+				u8 *pattern = nl80211_rx_filter_get_pattern(rx_filter,bss);
+
+				if (!pattern)
+					continue;
+
+				pat = nla_nest_start(pats, patnr++);
+				NLA_PUT(pats, NL80211_WOWLAN_PKTPAT_MASK,
+					rx_filter->mask_len,
+					rx_filter->mask);
+
+				NLA_PUT(pats, NL80211_WOWLAN_PKTPAT_PATTERN,
+					rx_filter->pattern_len,
+					pattern);
+
+				nla_nest_end(pats, pat);
+			}
+		}
+	}
+
+	if (pats)
+		nla_put_nested(msg, NL80211_WOWLAN_TRIG_PKT_PATTERN, pats);
+
+	nla_nest_end(msg, wowtrig);
+
+	ret = send_and_recv_msgs(bss->drv, msg, NULL, NULL);
+
+	if (ret < 0)
+		wpa_printf(MSG_ERROR, "Failed to set WoWLAN trigger:%d\n", ret);
+
+	if (pats)
+		nlmsg_free(pats);
+
+	return 0;
+
+nla_put_failure:
+	nlmsg_free(msg);
+	return ret;
+}
+
 static int nl80211_add_pmkid(void *priv, const u8 *bssid, const u8 *pmkid)
 {
-	struct i802_bss *bss = priv;
-	wpa_printf(MSG_DEBUG, "nl80211: Add PMKID for " MACSTR, MAC2STR(bssid));
-	return nl80211_pmkid(bss, NL80211_CMD_SET_PMKSA, bssid, pmkid);
+        struct i802_bss *bss = priv;
+        wpa_printf(MSG_DEBUG, "nl80211: Add PMKID for " MACSTR, MAC2STR(bssid));
+        return nl80211_pmkid(bss, NL80211_CMD_SET_PMKSA, bssid, pmkid);
 }
 
 
 static int nl80211_remove_pmkid(void *priv, const u8 *bssid, const u8 *pmkid)
 {
-	struct i802_bss *bss = priv;
-	wpa_printf(MSG_DEBUG, "nl80211: Delete PMKID for " MACSTR,
-		   MAC2STR(bssid));
-	return nl80211_pmkid(bss, NL80211_CMD_DEL_PMKSA, bssid, pmkid);
+        struct i802_bss *bss = priv;
+        wpa_printf(MSG_DEBUG, "nl80211: Delete PMKID for " MACSTR,
+                   MAC2STR(bssid));
+        return nl80211_pmkid(bss, NL80211_CMD_DEL_PMKSA, bssid, pmkid);
 }
 
 
 static int nl80211_flush_pmkid(void *priv)
 {
-	struct i802_bss *bss = priv;
-	wpa_printf(MSG_DEBUG, "nl80211: Flush PMKIDs");
-	return nl80211_pmkid(bss, NL80211_CMD_FLUSH_PMKSA, NULL, NULL);
+        struct i802_bss *bss = priv;
+        wpa_printf(MSG_DEBUG, "nl80211: Flush PMKIDs");
+        return nl80211_pmkid(bss, NL80211_CMD_FLUSH_PMKSA, NULL, NULL);
 }
 
+#ifdef ANDROID
+/* we start with "auto" power mode - power_save is on */
+static int g_power_mode = 0;
+
+static int nl80211_set_power_save(struct wpa_driver_nl80211_data *drv,
+			      enum nl80211_ps_state ps_state)
+{
+	struct nl_msg *msg;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return -ENOMEM;
+
+	genlmsg_put(msg, 0, 0, genl_family_get_id(drv->nl80211), 0,
+		    0, NL80211_CMD_SET_POWER_SAVE, 0);
+
+	NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, drv->ifindex);
+	NLA_PUT_U32(msg, NL80211_ATTR_PS_STATE, ps_state);
+
+	return send_and_recv_msgs(drv, msg, NULL, NULL);
+ nla_put_failure:
+	nlmsg_free(msg);
+	return -ENOBUFS;
+}
+
+
+static int nl80211_toggle_wowlan_trigger(struct i802_bss *bss, int nr,
+                                         int enabled)
+{
+	if (nr >= NR_RX_FILTERS) {
+		wpa_printf(MSG_ERROR, "Unknown filter: %d\n", nr);
+		return -1;
+	}
+
+	if (enabled)
+		bss->drv->wowlan_triggers |= 1 << nr;
+	else
+		bss->drv->wowlan_triggers &= ~(1 << nr);
+
+	if (bss->drv->wowlan_enabled)
+		nl80211_set_wowlan_triggers(bss, 1);
+
+	return 0;
+}
+
+static int nl80211_parse_wowlan_trigger_nr(char *s)
+{
+	long i;
+	char *endp;
+
+	i = strtol(s, &endp, 10);
+
+	if(endp == s)
+		return -1;
+	return i;
+}
+
+static int nl80211_priv_driver_cmd( void *priv, char *cmd, char *buf, size_t buf_len )
+{
+	struct i802_bss *bss = priv;
+	struct wpa_driver_nl80211_data *drv = bss->drv;
+	int ret = 0, flags;
+
+	wpa_printf(MSG_DEBUG, "%s %s len = %d", __func__, cmd, buf_len);
+
+	if (os_strcasecmp(cmd, "STOP") == 0) {
+		linux_set_iface_flags(drv->ioctl_sock, bss->ifname, 0);
+		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "STOPPED");
+	} else if (os_strcasecmp(cmd, "START") == 0) {
+		linux_set_iface_flags(drv->ioctl_sock, bss->ifname, 1);
+		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "STARTED");
+	} else if (os_strcasecmp(cmd, "MACADDR") == 0) {
+		u8 macaddr[ETH_ALEN] = {};
+
+		ret = linux_get_ifhwaddr(drv->ioctl_sock, bss->ifname, macaddr);
+		if (!ret)
+			ret = os_snprintf(buf, buf_len,
+					"Macaddr = " MACSTR "\n", MAC2STR(macaddr));
+	} else if ((os_strcasecmp(cmd, "RSSI") == 0) || (os_strcasecmp(cmd, "RSSI-APPROX") == 0)) {
+		struct wpa_signal_info sig;
+		int rssi;
+
+		if (!drv->associated)
+			return -1;
+
+		ret = nl80211_get_link_signal(drv, &sig);
+		if (ret == 0) {
+			rssi = sig.current_signal;
+			ret = os_snprintf(buf, buf_len, "%s rssi %d\n", drv->ssid, rssi);
+		}
+	} else if (os_strcasecmp(cmd, "LINKSPEED") == 0) {
+		struct wpa_signal_info sig;
+		int linkspeed;
+
+		if (!drv->associated)
+			return -1;
+
+		ret = nl80211_get_link_signal(drv, &sig);
+		if (ret == 0) {
+			linkspeed = sig.current_txrate;
+			ret = os_snprintf(buf, buf_len, "LinkSpeed %d\n", linkspeed);
+		}
+	} else if( os_strcasecmp(cmd, "RELOAD") == 0 ) {
+		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "HANGED");
+#if 0 /* Not implemented yet */
+	} else if( os_strcasecmp(cmd, "SCAN-PASSIVE") == 0 ) {
+		g_scan_type = IW_SCAN_TYPE_PASSIVE;
+		ret = 0;
+	} else if( os_strcasecmp(cmd, "SCAN-ACTIVE") == 0 ) {
+		g_scan_type = IW_SCAN_TYPE_ACTIVE;
+		ret = 0;
+	} else if( os_strcasecmp(cmd, "SCAN-MODE") == 0 ) {
+		ret = snprintf(buf, buf_len, "ScanMode = %u\n", g_scan_type);
+		if (ret < (int)buf_len)
+			return ret;
+	} else if( os_strncasecmp(cmd, "BTCOEXMODE", 10) == 0 ) {
+		int mode = atoi(cmd + 10);
+
+		wpa_printf(MSG_DEBUG, "will change btcoex mode to: %d", mode);
+
+		if (mode == 1) { /* disable BT-coex */
+			ret = wpa_driver_toggle_btcoex_state('0');
+		} else if (mode == 2) { /* enable BT-coex */
+			ret = wpa_driver_toggle_btcoex_state('1');
+		} else {
+			wpa_printf(MSG_DEBUG, "invalid btcoex mode: %d", mode);
+			ret = -1;
+		}
+#endif
+	} else if( os_strncasecmp(cmd, "POWERMODE", 9) == 0 ) {
+		int mode = atoi(cmd + 9);
+
+		if (mode == g_power_mode)
+			ret = 0;
+		else if (mode == 1) /* active mode */
+			ret = nl80211_set_power_save(drv, NL80211_PS_DISABLED);
+		else if (mode == 0) /* auto mode */
+			ret = nl80211_set_power_save(drv, NL80211_PS_ENABLED);
+
+		if (!ret)
+			g_power_mode = mode;
+
+		wpa_printf(MSG_DEBUG, "global POWERMODE set to %d (wanted %d), ret %d",
+			   g_power_mode, mode, ret);
+	} else if( os_strcasecmp(cmd, "GETPOWER") == 0 ) {
+		ret = sprintf(buf, "powermode = %u\n", g_power_mode);
+	} else if( os_strncasecmp(cmd, "RXFILTER-ADD ", 13) == 0 ) {
+		int i = nl80211_parse_wowlan_trigger_nr(cmd + 13);
+		if(i < 0)
+			return i;
+		return nl80211_toggle_wowlan_trigger(bss, i, 1);
+	} else if( os_strncasecmp(cmd, "RXFILTER-REMOVE ", 16) == 0 ) {
+		int i = nl80211_parse_wowlan_trigger_nr(cmd + 16);
+		if(i < 0)
+			return i;
+		return nl80211_toggle_wowlan_trigger(bss, i, 0);
+	} else if( os_strcasecmp(cmd, "RXFILTER-START") == 0 ) {
+		return nl80211_set_wowlan_triggers(bss, 1);
+	} else if( os_strcasecmp(cmd, "RXFILTER-STOP") == 0 ) {
+		return nl80211_set_wowlan_triggers(bss, 0);
+	} else {
+		wpa_printf(MSG_ERROR, "Unsupported command: %s", cmd);
+		ret = -1;
+	}
+
+	return ret;
+}
+#endif /* ANDROID */
 
 const struct wpa_driver_ops wpa_driver_nl80211_ops = {
 	.name = "nl80211",
@@ -7146,6 +7500,6 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
 	.set_ap_wps_ie = wpa_driver_set_ap_wps_p2p_ie,
 #endif
 #ifdef ANDROID
-	.driver_cmd = wpa_driver_nl80211_driver_cmd,
-#endif
+	.driver_cmd = nl80211_priv_driver_cmd,
+#endif /* ANDROID */
 };

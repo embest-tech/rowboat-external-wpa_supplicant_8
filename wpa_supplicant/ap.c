@@ -103,7 +103,9 @@ static int wpa_supplicant_conf_ap(struct wpa_supplicant *wpa_s,
 			}
 		}
 		if (mode && mode->ht_capab) {
+			bss->wmm_enabled = 1;
 			conf->ieee80211n = 1;
+			conf->ht_capab = mode->ht_capab;
 
 			/*
 			 * white-list capabilities that won't cause issues
